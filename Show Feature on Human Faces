@@ -1,0 +1,115 @@
+import os
+import sys
+import cv2
+import dlib
+import numpy as np
+
+PREDICTOR_PATH = 'shape_predictor_68_face_landmarks.dat'
+FACE_RECOG_MODEL_PATH = 'dlib_face_recognition_resnet_model_v1.dat'
+
+
+def load_models():
+    if not os.path.isfile(PREDICTOR_PATH):
+        raise FileNotFoundError(
+            f"Không tìm thấy {PREDICTOR_PATH}. Bạn cần tải về từ dlib model zoo.")
+    if not os.path.isfile(FACE_RECOG_MODEL_PATH):
+        raise FileNotFoundError(
+            f"Không tìm thấy {FACE_RECOG_MODEL_PATH}. Bạn cần tải về từ dlib model zoo.")
+
+    detector = dlib.get_frontal_face_detector()
+    predictor = dlib.shape_predictor(PREDICTOR_PATH)
+    face_rec_model = dlib.face_recognition_model_v1(FACE_RECOG_MODEL_PATH)
+    return detector, predictor, face_rec_model
+
+
+def extract_features(img, detector, predictor, face_rec_model):
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    dets = detector(rgb, 1)
+    results = []
+
+    for det in dets:
+        shape = predictor(rgb, det)
+        descriptor = np.array(face_rec_model.compute_face_descriptor(rgb, shape), dtype=np.float32)
+        results.append((det, shape, descriptor))
+
+    return results
+
+
+def draw_face_info(img, face_data):
+    for index, (det, shape, descriptor) in enumerate(face_data, start=1):
+        left, top, right, bottom = det.left(), det.top(), det.right(), det.bottom()
+        # Vẽ hình chữ nhật màu xanh trước rồi mới ghi các điểm đặc trưng lên
+        cv2.rectangle(img, (left, top), (right, bottom), (0, 255, 0), 2)
+        text = f'Face {index}: {descriptor.shape[0]}-D'
+        cv2.putText(img, text, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        for i in range(0, shape.num_parts):
+            x = shape.part(i).x
+            y = shape.part(i).y
+            cv2.circle(img, (x, y), 1, (0, 0, 255), -1)
+
+    return img
+
+
+def process_image(path, detector, predictor, face_rec_model):
+    img = cv2.imread(path)
+    if img is None:
+        raise FileNotFoundError(f"Không đọc được ảnh: {path}")
+
+    faces = extract_features(img, detector, predictor, face_rec_model)
+    if not faces:
+        print('Không tìm thấy khuôn mặt nào trên ảnh.')
+        return
+
+    for i, (_, _, descriptor) in enumerate(faces, start=1):
+        print(f'Khuôn mặt {i} descriptor (first 10 giá trị):')
+        print(descriptor[:10])
+        print(f'Tổng độ dài descriptor: {descriptor.shape[0]}')
+        print('-' * 40)
+
+    output = draw_face_info(img, faces)
+    cv2.imshow('Output', output)
+    cv2.waitKey(0)
+    cv2.destroyAllWindows()
+
+
+def process_webcam(detector, predictor, face_rec_model):
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError('Không mở được webcam.')
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        faces = extract_features(frame, detector, predictor, face_rec_model)
+        output = draw_face_info(frame, faces)
+        cv2.imshow('Webcam Face Features', output)
+
+        if cv2.waitKey(1) & 0xFF == 27:
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def main():
+    try:
+        detector, predictor, face_rec_model = load_models()
+    except FileNotFoundError as e:
+        print(e)
+        print('Hãy đặt hai file model bên cạnh script này:')
+        print(f' - {PREDICTOR_PATH}')
+        print(f' - {FACE_RECOG_MODEL_PATH}')
+        sys.exit(1)
+
+    if len(sys.argv) == 2:
+        process_image(sys.argv[1], detector, predictor, face_rec_model)
+    else:
+        print('Không có đường dẫn ảnh, dùng webcam. Nhấn ESC để thoát.')
+        process_webcam(detector, predictor, face_rec_model)
+
+
+if __name__ == '__main__':
+    main()
