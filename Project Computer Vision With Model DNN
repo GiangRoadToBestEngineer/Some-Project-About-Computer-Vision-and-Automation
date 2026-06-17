@@ -1,0 +1,51 @@
+import cv2
+import numpy as np
+# Mở webcam lấy khuôn mặt:
+cap=cv2.VideoCapture(0)
+# Tải mô hình đã huấn luyện (ngoài vòng lặp - chỉ tải 1 lần):
+net =cv2.dnn.readNetFromCaffe('deploy.prototxt', 'res10_300x300_ssd_iter_140000_fp16.caffemodel')
+
+while True:
+    # Đọc ảnh từ webcam:
+    ret,img=cap.read()
+    # Nếu không đọc được ảnh thì thoát:
+    if not ret:
+        break
+    # Chuẩn bị dữ liệu đầu vào:
+    # img : là ảnh phát hiện khuôn mặt
+    # 1.0: hệ số tỷ lệ co giãn cho ảnh
+    # (300,300): kích thước mô hình yêu cầu đầu vào
+    # (104.0, 177.0, 123.0): giá trị trung bình của các kênh màu (BGR) để chuẩn hóa ảnh
+    # swapRB=False: không hoán đổi kênh màu đỏ và xanh
+    blob = cv2.dnn.blobFromImage(cv2.resize(img, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=False, crop=False)
+    # Đặt dữ liệu đầu vào cho mô hình:
+    net.setInput(blob)
+    # Chạy mô hình để phát hiện khuôn mặt:
+    faces=net.forward()
+    # Lấy kich thước của ảnh đầu vào:
+    h=img.shape[0]
+    w=img.shape[1]
+    
+    #Duyêt qua tất cả các khuôn mặt được phát hiện:
+    for i in range(faces.shape[2]):
+        # Lấy độ tin cậy của khuôn mặt được phát hiện:
+        confidence=faces[0,0,i,2] #faces[0,0,i,2] là độ tin cậy của khuôn mặt được phát hiện
+        # Nếu độ tin cậy lớn hơn 0.5 thì vẽ hình chữ nhật xung quanh khuôn mặt:
+        if confidence>0.5:
+            # Lấy tọa độ của hình chữ nhật xung quanh khuôn mặt:
+            box=faces[0,0,i,3:7]*np.array([w,h,w,h])
+            (startX,startY,endX,endY)=box.astype('int')
+            # Vẽ hình chữ nhật xung quanh khuôn mặt:
+            cv2.rectangle(img,(startX,startY),(endX,endY),(0,255,0),2)
+            # Hiển thị độ tin cậy của khuôn mặt được phát hiện:
+            text='Face: {:.2f}%'.format(confidence*100)
+            cv2.putText(img,text,(startX,startY-10),cv2.FONT_HERSHEY_SIMPLEX,1,(255,255,255),2)
+    
+    # Hiển thị ảnh kết quả:
+    cv2.imshow('Output',img)
+    # Nhấn ESC để thoát (27 là mã ASCII của ESC):
+    if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
