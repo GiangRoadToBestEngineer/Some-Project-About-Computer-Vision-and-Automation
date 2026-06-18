@@ -1,0 +1,57 @@
+import cv2
+from ultralytics import YOLO
+
+def main():
+    print("Đang tải mô hình YOLO-World-Nano...")
+    try:
+        model = YOLO('yolov8s-worldv2.pt')
+    except Exception as e:
+        print("Lỗi khi tải mô hình:", e)
+        return
+
+    custom_classes = ["cell phone", "calculator", "person", "ruler", "book", "laptop", "mouse", "keyboard", "bottle", "cup"]
+    try:
+        model.set_classes(custom_classes)
+        print(f"Đã thiết lập từ vựng nhận diện: {custom_classes}")
+    except Exception as e:
+        print("Không thể thiết lập lớp tùy chỉnh bằng set_classes:", e)
+        print("Tiếp tục với tất cả lớp mặc định của YOLO-World.")
+
+    # 3. Mở Camera (Số 0 thường là camera mặc định của laptop/webcam)
+    cap = cv2.VideoCapture(0)
+    
+    if not cap.isOpened():
+        print("Lỗi: Không thể mở được Camera!")
+        return
+
+    print("Đang mở camera... Nhấn phím 'q' trên bàn phím để THOÁT.")
+
+    while True:
+        # Đọc từng khung hình từ camera
+        ret, frame = cap.read()
+        if not ret:
+            print("Không thể nhận dữ liệu từ camera.")
+            break
+
+        # 4. Đưa khung hình vào mô hình YOLO-World để dự đoán
+        # conf=0.15 là độ tự tin tối thiểu (15%) để hiển thị vật thể, bạn có thể tăng giảm tùy ý
+        results = model.predict(frame, conf=0.15, verbose=False)
+
+        # 5. Vẽ kết quả nhận diện lên khung hình
+        # Hàm plot() của ultralytics sẽ tự vẽ khung hình chữ nhật và viết tên vật thể lên ảnh
+        annotated_frame = results[0].plot()
+
+        # Hiển thị cửa sổ camera lên màn hình
+        cv2.imshow('YOLO-World Test cho Xe Tuan Tra', annotated_frame)
+
+        # Bấm nút 'q' trên bàn phím để tắt cửa sổ
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    # Giải phóng camera và đóng tất cả cửa sổ
+    cap.release()
+    cv2.destroyAllWindows()
+    print("Đã đóng chương trình.")
+
+if __name__ == "__main__":
+    main()
