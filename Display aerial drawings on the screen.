@@ -1,6 +1,6 @@
 import cv2
 import mediapipe as mp
-import numpy as np  # Thêm thư viện NumPy để xử lý ảnh nền
+import numpy as np 
 
 # Thiết lập MediaPipe
 mp_hands = mp.solutions.hands
