@@ -1,7 +1,7 @@
 import cv2
 import time
 
-# 1. Khởi tạo bộ nhận diện
+# 1. Khởi tạo bộ nhận diện ( Cài model nhận diện)
 xml_path = r'C:\Users\NEOVIA\Desktop\01\haarcascade_frontalface_default.xml'
 xml_path1 = r'C:\Users\NEOVIA\Desktop\01\haarcascade_eye.xml'
 xml_path2 = r'C:\Users\NEOVIA\Desktop\01\haarcascade_fullbody.xml'
