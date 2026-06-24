@@ -1,0 +1,121 @@
+#include <opencv2/opencv.hpp>
+#include <opencv2/objdetect.hpp>
+#include <opencv2/face.hpp>
+#include <iostream>
+#include <string>
+
+int main(int argc, char* argv[])
+{
+    // Mở webcam (0 là webcam mặc định)
+    cv::VideoCapture cap(0);
+    if (!cap.isOpened()) {
+        std::cerr << "Lỗi: Không thể mở webcam!\n";
+        return -1;
+    }
+
+    std::cout << "Đã mở webcam thành công\n";
+
+    // Load cascade classifier để phát hiện mặt
+    cv::CascadeClassifier face_cascade;
+    std::string cascade_path = "haarcascade_frontalface_default.xml";
+    if (!face_cascade.load(cascade_path)) {
+        std::cerr << "Lỗi: Không thể load " << cascade_path << "\n";
+        std::cerr << "Hãy đặt file cascade trong thư mục chương trình\n";
+        return -1;
+    }
+
+    std::cout << "Đã load cascade classifier thành công\n";
+
+    // Load model landmark (tùy chọn)
+    cv::Ptr<cv::face::Facemark> facemark = nullptr;
+    std::string landmark_model = "lbfmodel.yaml";
+    try {
+        facemark = cv::face::FacemarkLBF::create();
+        if (!facemark->loadModel(landmark_model)) {
+            std::cerr << "Cảnh báo: Không thể load " << landmark_model << "\n";
+            std::cerr << "Chương trình sẽ chỉ phát hiện mặt, không landmark\n";
+            facemark = nullptr;
+        } else {
+            std::cout << "Đã load landmark model thành công\n";
+        }
+    } catch (...) {
+        std::cerr << "Cảnh báo: Lỗi khi load landmark model\n";
+        facemark = nullptr;
+    }
+
+    cv::Mat frame;
+    int frame_count = 0;
+
+    std::cout << "Đang chạy... Nhấn ESC để thoát\n";
+
+    while (true) {
+        cap >> frame;
+        if (frame.empty()) {
+            std::cerr << "Lỗi: Không đọc được frame từ webcam\n";
+            break;
+        }
+
+        frame_count++;
+
+        // Chuyển sang grayscale để phát hiện mặt
+        cv::Mat gray;
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+        // Phát hiện các khuôn mặt
+        std::vector<cv::Rect> faces;
+        face_cascade.detectMultiScale(
+            gray,
+            faces,
+            1.1,              // scaleFactor
+            3,                // minNeighbors
+            0,                // flags
+            cv::Size(80, 80)  // minSize
+        );
+
+        // Phát hiện landmark nếu có model
+        std::vector<std::vector<cv::Point2f>> landmarks;
+        if (facemark && !faces.empty()) {
+            facemark->fit(frame, faces, landmarks);
+        }
+
+        // Vẽ các hộp bao quanh mặt
+        for (size_t i = 0; i < faces.size(); i++) {
+            // Vẽ hộp xanh lá
+            cv::rectangle(frame, faces[i], cv::Scalar(0, 255, 0), 2);
+
+            // Vẽ số thứ tự mặt
+            std::string face_label = "Face " + std::to_string(i + 1);
+            cv::putText(frame, face_label, 
+                       cv::Point(faces[i].x, faces[i].y - 10),
+                       cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(0, 255, 0), 2);
+
+            // Vẽ các điểm landmark (nếu có)
+            if (i < landmarks.size()) {
+                for (size_t j = 0; j < landmarks[i].size(); j++) {
+                    cv::circle(frame, landmarks[i][j], 2, cv::Scalar(0, 0, 255), cv::FILLED);
+                }
+            }
+        }
+
+        // Vẽ thông tin số lượng mặt phát hiện
+        std::string status = "Phát hiện: " + std::to_string(faces.size()) + " mặt | Frame: " + std::to_string(frame_count);
+        cv::putText(frame, status, 
+                   cv::Point(10, 30),
+                   cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+
+        // Hiển thị frame
+        cv::imshow("Face Feature Detection", frame);
+
+        // Nhấn ESC (key code 27) để thoát
+        int key = cv::waitKey(30);
+        if (key == 27) {
+            std::cout << "\nĐã thoát chương trình.\n";
+            break;
+        }
+    }
+
+    cap.release();
+    cv::destroyAllWindows();
+
+    return 0;
+}
