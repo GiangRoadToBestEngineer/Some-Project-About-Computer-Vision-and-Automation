@@ -1,126 +1,141 @@
 import cv2
 import numpy as np
 import onnxruntime as ort
-from picamera2 import Picamera2
+from picam2 import Picamera2
 
-# 1. KHỞI TẠO PICAMERA2
+# ---------------------------------------------------------
+# 1. CẤU HÌNH TỐI ƯU TỐC ĐỘ
+# ---------------------------------------------------------
+MODEL_PATH = "yolo26n.onnx"   # File ONNX của bạn
+AI_SIZE = 320                  # Giảm từ 640 xuống 320 để AI chạy nhanh gấp 4 lần
+FRAME_SKIP = 3                 # Chạy AI 1 lần mỗi 3 khung hình
+
+# Tối ưu hóa 4 nhân CPU cho ONNX Runtime
+opts = ort.SessionOptions()
+opts.intra_op_num_threads = 4
+opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+print(f"Đang nạp mô hình {MODEL_PATH} với kích thước AI {AI_SIZE}x{AI_SIZE}...")
+session = ort.InferenceSession(MODEL_PATH, opts, providers=['CPUExecutionProvider'])
+input_name = session.get_inputs()[0].name
+output_name = session.get_outputs()[0].name
+
+# Khởi tạo Pi Camera
 print("Đang mở Pi Camera...")
 picam2 = Picamera2()
 config = picam2.create_preview_configuration(main={"size": (640, 480)})
 picam2.configure(config)
 picam2.start()
 
-# 2. NẠP MÔ HÌNH YOLO26N BẰNG ONNXRUNTIME
-MODEL_PATH = "yolo26n.onnx"
-print(f"Đang nạp mô hình: {MODEL_PATH}...")
-session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
-input_name = session.get_inputs()[0].name
-output_name = session.get_outputs()[0].name
+# Các biến lưu trạng thái khung hình
+frame_count = 0
+last_boxes = []
+last_fall_detected = False
 
-print("Đang chạy... Bấm phím 'q' trên màn hình hiển thị để thoát.")
+print("Đang chạy... Bấm 'q' để thoát.")
 
 while True:
-    # Đọc khung hình từ Pi Camera
     frame_rgb = picam2.capture_array()
     frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
     h_orig, w_orig = frame.shape[:2]
+    
+    frame_count += 1
 
-    # Tiền xử lý ảnh (640x640, Normalize 0-1, NCHW format)
-    img_resized = cv2.resize(frame, (640, 640))
-    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
-    input_tensor = img_rgb.astype(np.float32) / 255.0
-    input_tensor = np.transpose(input_tensor, (2, 0, 1))
-    input_tensor = np.expand_dims(input_tensor, axis=0)
+    # ---------------------------------------------------------
+    # 2. CHỈ CHẠY AI KHI TỚI NHỊP FRAME_SKIP (TIẾT KIỆM CPU)
+    # ---------------------------------------------------------
+    if frame_count % FRAME_SKIP == 0:
+        # Resize ảnh về 320x320 cho AI
+        img_resized = cv2.resize(frame, (AI_SIZE, AI_SIZE))
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        input_tensor = img_rgb.astype(np.float32) / 255.0
+        input_tensor = np.transpose(input_tensor, (2, 0, 1))
+        input_tensor = np.expand_dims(input_tensor, axis=0)
 
-    # Chạy suy luận qua ONNX Runtime
-    outputs = session.run([output_name], {input_name: input_tensor})
-    preds = np.squeeze(outputs[0])
+        # Suy luận AI
+        outputs = session.run([output_name], {input_name: input_tensor})
+        preds = np.squeeze(outputs[0])
 
-    boxes = []
-    scores_list = []
+        current_boxes = []
+        scores_list = []
 
-    # TỰ ĐỘNG NHẬN DIỆN VÀ XỬ LÝ ĐẦU RA CỦA YOLO26N
-    # Trường hợp 1: Đầu ra End-to-End NMS (Ma trận dạng [N, 6]: x1, y1, x2, y2, score, class_id)
-    if preds.ndim == 2 and preds.shape[1] == 6:
-        for pred in preds:
-            x1_640, y1_640, x2_640, y2_640, score, class_id = pred
-            if int(class_id) == 0 and score > 0.45:  # Class 0: Người
-                bw = int((x2_640 - x1_640) * (w_orig / 640.0))
-                bh = int((y2_640 - y1_640) * (h_orig / 640.0))
-                x1 = int(x1_640 * (w_orig / 640.0))
-                y1 = int(y1_640 * (h_orig / 640.0))
-                boxes.append([x1, y1, bw, bh])
+        # Xử lý ma trận đầu ra
+        if preds.ndim == 2 and preds.shape[1] == 6:  # End-to-End
+            for pred in preds:
+                x1_ai, y1_ai, x2_ai, y2_ai, score, class_id = pred
+                if int(class_id) == 0 and score > 0.40:
+                    bw = int((x2_ai - x1_ai) * (w_orig / float(AI_SIZE)))
+                    bh = int((y2_ai - y1_ai) * (h_orig / float(AI_SIZE)))
+                    x1 = int(x1_ai * (w_orig / float(AI_SIZE)))
+                    y1 = int(y1_ai * (h_orig / float(AI_SIZE)))
+                    current_boxes.append([x1, y1, bw, bh])
+                    scores_list.append(float(score))
+            indices = list(range(len(current_boxes)))
+        else:  # Raw Output
+            if preds.shape[0] == 84:
+                preds = preds.T
+            person_scores = preds[:, 4]
+            mask = person_scores > 0.40
+            valid_preds = preds[mask]
+            valid_scores = person_scores[mask]
+
+            for pred, score in zip(valid_preds, valid_scores):
+                cx, cy, w, h = pred[0], pred[1], pred[2], pred[3]
+                bw = int(w * (w_orig / float(AI_SIZE)))
+                bh = int(h * (h_orig / float(AI_SIZE)))
+                x1 = int((cx - w / 2) * (w_orig / float(AI_SIZE)))
+                y1 = int((cy - h / 2) * (h_orig / float(AI_SIZE)))
+                current_boxes.append([x1, y1, bw, bh])
                 scores_list.append(float(score))
-        indices = list(range(len(boxes)))
 
-    # Trường hợp 2: Đầu ra Raw tiêu chuẩn (Ma trận dạng [84, 8400])
-    else:
-        if preds.shape[0] == 84:
-            preds = preds.T
-        
-        person_scores = preds[:, 4]
-        mask = person_scores > 0.45
-        valid_preds = preds[mask]
-        valid_scores = person_scores[mask]
+            nms_out = cv2.dnn.NMSBoxes(current_boxes, scores_list, score_threshold=0.40, nms_threshold=0.5)
+            indices = nms_out.flatten() if len(nms_out) > 0 else []
 
-        for pred, score in zip(valid_preds, valid_scores):
-            cx, cy, w, h = pred[0], pred[1], pred[2], pred[3]
-            bw = int(w * (w_orig / 640.0))
-            bh = int(h * (h_orig / 640.0))
-            x1 = int((cx - w / 2) * (w_orig / 640.0))
-            y1 = int((cy - h / 2) * (h_orig / 640.0))
-            boxes.append([x1, y1, bw, bh])
-            scores_list.append(float(score))
+        # Cập nhật danh sách Bounding Box mới nhất
+        last_boxes = [current_boxes[i] for i in indices]
+        last_fall_detected = False
 
-        nms_out = cv2.dnn.NMSBoxes(boxes, scores_list, score_threshold=0.45, nms_threshold=0.5)
-        indices = nms_out.flatten() if len(nms_out) > 0 else []
-
+    # ---------------------------------------------------------
+    # 3. HIỂN THỊ KẾT QUẢ VÀ BÁO ĐỘNG (CHẠY TRÊN MỌI FRAME)
+    # ---------------------------------------------------------
     annotated_frame = frame.copy()
-    fall_detected = False
 
-    if len(indices) > 0:
-        for idx in indices:
-            x1, y1, w, h = boxes[idx]
-            x2, y2 = x1 + w, y1 + h
+    for (x1, y1, w, h) in last_boxes:
+        x2, y2 = x1 + w, y1 + h
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w_orig, x2), min(h_orig, y2)
 
-            # Cắt tọa độ trong lòng khung hình
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w_orig, x2), min(h_orig, y2)
+        A, B, C, D = (x1, y1), (x2, y1), (x2, y2), (x1, y2)
+        AB = x2 - x1
+        AD = y2 - y1
 
-            A, B, C, D = (x1, y1), (x2, y1), (x2, y2), (x1, y2)
-            AB = x2 - x1  # Chiều rộng
-            AD = y2 - y1  # Chiều cao
+        is_lying = AB > AD
+        box_color = (0, 0, 255) if is_lying else (0, 255, 0)
 
-            # ĐIỀU KIỆN TÉ NGÃ: Chiều rộng AB > Chiều cao AD
-            is_lying = AB > AD
-            box_color = (0, 0, 255) if is_lying else (0, 255, 0)
+        # Vẽ Bounding Box & nhãn
+        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, 2)
+        cv2.putText(annotated_frame, "A", (A[0] - 10, A[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+        cv2.putText(annotated_frame, "B", (B[0] + 5, B[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+        cv2.putText(annotated_frame, "C", (C[0] + 5, C[1] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+        cv2.putText(annotated_frame, "D", (D[0] - 10, D[1] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
 
-            # Vẽ Bounding Box và tọa độ 4 đỉnh
-            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, 2)
-            cv2.putText(annotated_frame, "A", (A[0] - 10, A[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-            cv2.putText(annotated_frame, "B", (B[0] + 5, B[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-            cv2.putText(annotated_frame, "C", (C[0] + 5, C[1] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-            cv2.putText(annotated_frame, "D", (D[0] - 10, D[1] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+        cv2.putText(annotated_frame, f"AB={AB}px, AD={AD}px", (x1, max(20, y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
 
-            cv2.putText(annotated_frame, f"AB={AB}px, AD={AD}px", (x1, max(20, y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+        if is_lying:
+            last_fall_detected = True
 
-            if is_lying:
-                fall_detected = True
-
-    # CẢNH BÁO BÁO ĐỘNG ĐỎ KHI AB > AD (TÉ NGÃ)
-    if fall_detected:
-        cv2.rectangle(annotated_frame, (0, 0), (w_orig, h_orig), (0, 0, 255), 12)
-        red_overlay = np.zeros_like(annotated_frame, dtype=np.uint8)
-        red_overlay[:] = (0, 0, 200)
-        annotated_frame = cv2.addWeighted(annotated_frame, 0.75, red_overlay, 0.25, 0)
+    # Báo động đỏ khi té ngã
+    if last_fall_detected:
+        cv2.rectangle(annotated_frame, (0, 0), (w_orig, h_orig), (0, 0, 255), 10)
         cv2.putText(annotated_frame, "BAO DONG DO: CANH AB > AD (TE NGA)!", (10, 35),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    cv2.imshow("Raspberry Pi 64-bit - YOLO26 Fall Detection", annotated_frame)
+    cv2.imshow("Raspberry Pi 3B+ - Fast Fall Detection", annotated_frame)
+
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
-# Dọn dẹp tài nguyên
 picam2.stop()
 cv2.destroyAllWindows()
