@@ -2,21 +2,21 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 from picam2 import Picamera2
+import threading
+import time
 
 # ---------------------------------------------------------
-# 1. CẤU HÌNH TỐI ƯU TỐC ĐỘ
+# 1. CẤU HÌNH MÔ HÌNH VÀ ONNX RUNTIME
 # ---------------------------------------------------------
-MODEL_PATH = "yolo26n.onnx"   # File ONNX của bạn
-AI_SIZE = 320                  # Giảm từ 640 xuống 320 để AI chạy nhanh gấp 4 lần
-FRAME_SKIP = 3                 # Chạy AI 1 lần mỗi 3 khung hình
+MODEL_PATH = "yolo26n.onnx"
+AI_SIZE = 640  # Khớp chuẩn 640x640 của mô hình
 
-# Tối ưu hóa 4 nhân CPU cho ONNX Runtime
 opts = ort.SessionOptions()
 opts.intra_op_num_threads = 4
 opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-print(f"Đang nạp mô hình {MODEL_PATH} với kích thước AI {AI_SIZE}x{AI_SIZE}...")
+print("Đang nạp mô hình AI...")
 session = ort.InferenceSession(MODEL_PATH, opts, providers=['CPUExecutionProvider'])
 input_name = session.get_inputs()[0].name
 output_name = session.get_outputs()[0].name
@@ -28,39 +28,45 @@ config = picam2.create_preview_configuration(main={"size": (640, 480)})
 picam2.configure(config)
 picam2.start()
 
-# Các biến lưu trạng thái khung hình
-frame_count = 0
-last_boxes = []
-last_fall_detected = False
+# Các biến dùng chung giữa các luồng (Shared Variables)
+latest_frame = None
+frame_lock = threading.Lock()
+boxes_lock = threading.Lock()
 
-print("Đang chạy... Bấm 'q' để thoát.")
+shared_boxes = []
+shared_fall_detected = False
+is_running = True
 
-while True:
-    frame_rgb = picam2.capture_array()
-    frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-    h_orig, w_orig = frame.shape[:2]
+# ---------------------------------------------------------
+# 2. LUỒNG CHẠY AI NGẦM (BACKGROUND AI THREAD)
+# ---------------------------------------------------------
+def ai_worker():
+    global shared_boxes, shared_fall_detected, is_running
     
-    frame_count += 1
+    while is_running:
+        # Lấy khung hình mới nhất từ luồng chính
+        with frame_lock:
+            if latest_frame is None:
+                time.sleep(0.01)
+                continue
+            frame_to_process = latest_frame.copy()
 
-    # ---------------------------------------------------------
-    # 2. CHỈ CHẠY AI KHI TỚI NHỊP FRAME_SKIP (TIẾT KIỆM CPU)
-    # ---------------------------------------------------------
-    if frame_count % FRAME_SKIP == 0:
-        # Resize ảnh về 320x320 cho AI
-        img_resized = cv2.resize(frame, (AI_SIZE, AI_SIZE))
+        h_orig, w_orig = frame_to_process.shape[:2]
+
+        # Tiền xử lý
+        img_resized = cv2.resize(frame_to_process, (AI_SIZE, AI_SIZE))
         img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
         input_tensor = img_rgb.astype(np.float32) / 255.0
         input_tensor = np.transpose(input_tensor, (2, 0, 1))
         input_tensor = np.expand_dims(input_tensor, axis=0)
 
-        # Suy luận AI
+        # Suy luận AI ngầm (Không làm ảnh hưởng luồng hiển thị)
         outputs = session.run([output_name], {input_name: input_tensor})
         preds = np.squeeze(outputs[0])
 
         current_boxes = []
         scores_list = []
 
-        # Xử lý ma trận đầu ra
         if preds.ndim == 2 and preds.shape[1] == 6:  # End-to-End
             for pred in preds:
                 x1_ai, y1_ai, x2_ai, y2_ai, score, class_id = pred
@@ -92,16 +98,46 @@ while True:
             nms_out = cv2.dnn.NMSBoxes(current_boxes, scores_list, score_threshold=0.40, nms_threshold=0.5)
             indices = nms_out.flatten() if len(nms_out) > 0 else []
 
-        # Cập nhật danh sách Bounding Box mới nhất
-        last_boxes = [current_boxes[i] for i in indices]
-        last_fall_detected = False
+        # Kiểm tra điều kiện té ngã
+        new_boxes = [current_boxes[i] for i in indices]
+        fall = False
+        for (x1, y1, w, h) in new_boxes:
+            if w > h:
+                fall = True
+                break
 
-    # ---------------------------------------------------------
-    # 3. HIỂN THỊ KẾT QUẢ VÀ BÁO ĐỘNG (CHẠY TRÊN MỌI FRAME)
-    # ---------------------------------------------------------
+        # Cập nhật kết quả sang luồng chính
+        with boxes_lock:
+            shared_boxes = new_boxes
+            shared_fall_detected = fall
+
+# Kích hoạt luồng AI chạy song song
+ai_thread = threading.Thread(target=ai_worker, daemon=True)
+ai_thread.start()
+
+# ---------------------------------------------------------
+# 3. LUỒNG CHÍNH: LẤY ẢNH VÀ HIỂN THỊ CỰC MƯỢT (MAIN LOOP)
+# ---------------------------------------------------------
+print("Hệ thống đã sẵn sàng! Bấm 'q' để thoát.")
+
+while True:
+    frame_rgb = picam2.capture_array()
+    frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+    h_orig, w_orig = frame.shape[:2]
+
+    # Cập nhật khung hình mới cho luồng AI
+    with frame_lock:
+        latest_frame = frame.copy()
+
+    # Lấy tọa độ Bounding Box mới nhất từ luồng AI
+    with boxes_lock:
+        boxes = list(shared_boxes)
+        fall_detected = shared_fall_detected
+
     annotated_frame = frame.copy()
 
-    for (x1, y1, w, h) in last_boxes:
+    # Vẽ kết quả lên khung hình hiển thị
+    for (x1, y1, w, h) in boxes:
         x2, y2 = x1 + w, y1 + h
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w_orig, x2), min(h_orig, y2)
@@ -113,28 +149,24 @@ while True:
         is_lying = AB > AD
         box_color = (0, 0, 255) if is_lying else (0, 255, 0)
 
-        # Vẽ Bounding Box & nhãn
         cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, 2)
         cv2.putText(annotated_frame, "A", (A[0] - 10, A[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
         cv2.putText(annotated_frame, "B", (B[0] + 5, B[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
         cv2.putText(annotated_frame, "C", (C[0] + 5, C[1] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
         cv2.putText(annotated_frame, "D", (D[0] - 10, D[1] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-
         cv2.putText(annotated_frame, f"AB={AB}px, AD={AD}px", (x1, max(20, y1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
 
-        if is_lying:
-            last_fall_detected = True
-
-    # Báo động đỏ khi té ngã
-    if last_fall_detected:
+    # Hiển thị cảnh báo báo động đỏ
+    if fall_detected:
         cv2.rectangle(annotated_frame, (0, 0), (w_orig, h_orig), (0, 0, 255), 10)
         cv2.putText(annotated_frame, "BAO DONG DO: CANH AB > AD (TE NGA)!", (10, 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    cv2.imshow("Raspberry Pi 3B+ - Fast Fall Detection", annotated_frame)
+    cv2.imshow("Raspberry Pi 3B+ - Smooth Threaded Fall Detection", annotated_frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
+        is_running = False
         break
 
 picam2.stop()
