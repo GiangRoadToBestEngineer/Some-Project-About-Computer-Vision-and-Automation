@@ -3,20 +3,26 @@ import numpy as np
 import onnxruntime as ort
 from picam2 import Picamera2
 import threading
+import math
 import time
 
 # ---------------------------------------------------------
-# 1. CẤU HÌNH MÔ HÌNH VÀ ONNX RUNTIME
+# 1. CẤU HÌNH THAM SỐ THÔNG MINH CHO ROBOT TUẦN TRA
 # ---------------------------------------------------------
-MODEL_PATH = "yolo26n.onnx"
-AI_SIZE = 640  # Khớp chuẩn 640x640 của mô hình
+MODEL_PATH = "yolo26n-pose.onnx"  # Hoặc yolov8n-pose.onnx
+AI_SIZE = 640
 
+ANGLE_THRESHOLD = 55        # Góc nghiêng cột sống > 55 độ coi là nằm ngang
+FLOOR_RATIO = 0.60          # Hông phải nằm ở 40% vùng dưới màn hình (sát sàn)
+CONFIRM_COUNT_REQ = 3       # Phải thỏa mãn liên tiếp 3 nhịp AI mới báo động (chống giật)
+
+# Cấu hình ONNX Runtime tối ưu 4 nhân CPU Pi 3B+
 opts = ort.SessionOptions()
 opts.intra_op_num_threads = 4
 opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
-print("Đang nạp mô hình AI...")
+print("Đang nạp mô hình Pose AI...")
 session = ort.InferenceSession(MODEL_PATH, opts, providers=['CPUExecutionProvider'])
 input_name = session.get_inputs()[0].name
 output_name = session.get_outputs()[0].name
@@ -28,23 +34,22 @@ config = picam2.create_preview_configuration(main={"size": (640, 480)})
 picam2.configure(config)
 picam2.start()
 
-# Các biến dùng chung giữa các luồng (Shared Variables)
+# Các biến dùng chung giữa các luồng
 latest_frame = None
 frame_lock = threading.Lock()
-boxes_lock = threading.Lock()
+data_lock = threading.Lock()
 
-shared_boxes = []
-shared_fall_detected = False
+shared_results = []
 is_running = True
+fall_confirm_counter = 0  # Bộ đếm xác nhận té ngã
 
 # ---------------------------------------------------------
-# 2. LUỒNG CHẠY AI NGẦM (BACKGROUND AI THREAD)
+# 2. LUỒNG TÍNH TOÁN POSE AI & LOGIC CHỐNG BÁO GIẢ
 # ---------------------------------------------------------
-def ai_worker():
-    global shared_boxes, shared_fall_detected, is_running
-    
+def ai_pose_worker():
+    global shared_results, is_running, fall_confirm_counter
+
     while is_running:
-        # Lấy khung hình mới nhất từ luồng chính
         with frame_lock:
             if latest_frame is None:
                 time.sleep(0.01)
@@ -52,118 +57,171 @@ def ai_worker():
             frame_to_process = latest_frame.copy()
 
         h_orig, w_orig = frame_to_process.shape[:2]
+        floor_y_limit = int(h_orig * FLOOR_RATIO)  # Ngưỡng độ cao mặt sàn
 
-        # Tiền xử lý
+        # Tiền xử lý ảnh
         img_resized = cv2.resize(frame_to_process, (AI_SIZE, AI_SIZE))
         img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
         input_tensor = img_rgb.astype(np.float32) / 255.0
         input_tensor = np.transpose(input_tensor, (2, 0, 1))
         input_tensor = np.expand_dims(input_tensor, axis=0)
 
-        # Suy luận AI ngầm (Không làm ảnh hưởng luồng hiển thị)
+        # Chạy suy luận AI
         outputs = session.run([output_name], {input_name: input_tensor})
-        preds = np.squeeze(outputs[0])
+        preds = np.squeeze(outputs[0])  # Ma trận (56, 8400)
 
-        current_boxes = []
+        if preds.shape[0] == 56:
+            preds = preds.T
+
+        # Lọc class Người (Class 0)
+        person_scores = preds[:, 4]
+        mask = person_scores > 0.40
+        valid_preds = preds[mask]
+        valid_scores = person_scores[mask]
+
+        boxes = []
         scores_list = []
+        for pred, score in zip(valid_preds, valid_scores):
+            cx, cy, w, h = pred[0], pred[1], pred[2], pred[3]
+            bw = int(w * (w_orig / float(AI_SIZE)))
+            bh = int(h * (h_orig / float(AI_SIZE)))
+            x1 = int((cx - w / 2) * (w_orig / float(AI_SIZE)))
+            y1 = int((cy - h / 2) * (h_orig / float(AI_SIZE)))
+            boxes.append([x1, y1, bw, bh])
+            scores_list.append(float(score))
 
-        if preds.ndim == 2 and preds.shape[1] == 6:  # End-to-End
-            for pred in preds:
-                x1_ai, y1_ai, x2_ai, y2_ai, score, class_id = pred
-                if int(class_id) == 0 and score > 0.40:
-                    bw = int((x2_ai - x1_ai) * (w_orig / float(AI_SIZE)))
-                    bh = int((y2_ai - y1_ai) * (h_orig / float(AI_SIZE)))
-                    x1 = int(x1_ai * (w_orig / float(AI_SIZE)))
-                    y1 = int(y1_ai * (h_orig / float(AI_SIZE)))
-                    current_boxes.append([x1, y1, bw, bh])
-                    scores_list.append(float(score))
-            indices = list(range(len(current_boxes)))
-        else:  # Raw Output
-            if preds.shape[0] == 84:
-                preds = preds.T
-            person_scores = preds[:, 4]
-            mask = person_scores > 0.40
-            valid_preds = preds[mask]
-            valid_scores = person_scores[mask]
+        nms_out = cv2.dnn.NMSBoxes(boxes, scores_list, score_threshold=0.40, nms_threshold=0.5)
+        indices = nms_out.flatten() if len(nms_out) > 0 else []
 
-            for pred, score in zip(valid_preds, valid_scores):
-                cx, cy, w, h = pred[0], pred[1], pred[2], pred[3]
-                bw = int(w * (w_orig / float(AI_SIZE)))
-                bh = int(h * (h_orig / float(AI_SIZE)))
-                x1 = int((cx - w / 2) * (w_orig / float(AI_SIZE)))
-                y1 = int((cy - h / 2) * (h_orig / float(AI_SIZE)))
-                current_boxes.append([x1, y1, bw, bh])
-                scores_list.append(float(score))
+        current_results = []
+        any_real_fall_this_frame = False
 
-            nms_out = cv2.dnn.NMSBoxes(current_boxes, scores_list, score_threshold=0.40, nms_threshold=0.5)
-            indices = nms_out.flatten() if len(nms_out) > 0 else []
+        for idx in indices:
+            pred = valid_preds[idx]
+            x1, y1, w, h = boxes[idx]
 
-        # Kiểm tra điều kiện té ngã
-        new_boxes = [current_boxes[i] for i in indices]
-        fall = False
-        for (x1, y1, w, h) in new_boxes:
-            if w > h:
-                fall = True
-                break
+            # Lấy tọa độ 4 khớp xương: Vai trái (5), Vai phải (6), Hông trái (11), Hông phải (12)
+            l_sh = (int(pred[20] * (w_orig / float(AI_SIZE))), int(pred[21] * (h_orig / float(AI_SIZE))), pred[22])
+            r_sh = (int(pred[23] * (w_orig / float(AI_SIZE))), int(pred[24] * (h_orig / float(AI_SIZE))), pred[25])
+            l_hp = (int(pred[38] * (w_orig / float(AI_SIZE))), int(pred[39] * (h_orig / float(AI_SIZE))), pred[40])
+            r_hp = (int(pred[41] * (w_orig / float(AI_SIZE))), int(pred[42] * (h_orig / float(AI_SIZE))), pred[43])
 
-        # Cập nhật kết quả sang luồng chính
-        with boxes_lock:
-            shared_boxes = new_boxes
-            shared_fall_detected = fall
+            has_shoulders = l_sh[2] > 0.3 or r_sh[2] > 0.3
+            has_hips = l_hp[2] > 0.3 or r_hp[2] > 0.3
 
-# Kích hoạt luồng AI chạy song song
-ai_thread = threading.Thread(target=ai_worker, daemon=True)
+            angle_deg = 0
+            is_horizontal = False
+            is_on_floor = False
+
+            if has_shoulders and has_hips:
+                sh_center = ((l_sh[0] + r_sh[0]) // 2, (l_sh[1] + r_sh[1]) // 2)
+                hp_center = ((l_hp[0] + r_hp[0]) // 2, (l_hp[1] + r_hp[1]) // 2)
+
+                dx = sh_center[0] - hp_center[0]
+                dy = sh_center[1] - hp_center[1]
+
+                # 1. TÍNH GÓC NGHIÊNG CỘT SỐNG
+                angle_deg = math.degrees(math.atan2(abs(dx), abs(dy)))
+                if angle_deg > ANGLE_THRESHOLD:
+                    is_horizontal = True
+
+                # 2. KIỂM TRA ĐỘ CAO SO VỚI MẶT SÀN
+                if hp_center[1] >= floor_y_limit:
+                    is_on_floor = True
+
+            # PHÂN LOẠI TRẠNG THÁI
+            status_code = 0  # 0: Bình thường (Đứng/Ngồi)
+            if is_horizontal:
+                if is_on_floor:
+                    status_code = 2  # 2: TÉ NGÃ DƯỚI SÀN (NGUY HIỂM)
+                    any_real_fall_this_frame = True
+                else:
+                    status_code = 1  # 1: NẰM TRÊN GIƯỜNG / SOFA (AN TOÀN)
+
+            current_results.append({
+                'box': [x1, y1, w, h],
+                'status': status_code,
+                'angle': int(angle_deg),
+                'kpts': [l_sh, r_sh, l_hp, r_hp]
+            })
+
+        # 3. BỘ ĐỆM XÁC NHẬN THỜI GIAN (Xóa bỏ báo động giả do giật frame)
+        if any_real_fall_this_frame:
+            fall_confirm_counter += 1
+        else:
+            fall_confirm_counter = max(0, fall_confirm_counter - 1)
+
+        with data_lock:
+            shared_results = current_results
+
+# Kích hoạt luồng AI chạy ngầm
+ai_thread = threading.Thread(target=ai_pose_worker, daemon=True)
 ai_thread.start()
 
 # ---------------------------------------------------------
-# 3. LUỒNG CHÍNH: LẤY ẢNH VÀ HIỂN THỊ CỰC MƯỢT (MAIN LOOP)
+# 3. LUỒNG CHÍNH: HIỂN THỊ CỰC MƯỢT TRÊN MÀN HÌNH
 # ---------------------------------------------------------
-print("Hệ thống đã sẵn sàng! Bấm 'q' để thoát.")
+print("Hệ thống Robot Fall Detection đã sẵn sàng! Bấm 'q' để thoát.")
 
 while True:
     frame_rgb = picam2.capture_array()
     frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
     h_orig, w_orig = frame.shape[:2]
+    floor_y_limit = int(h_orig * FLOOR_RATIO)
 
-    # Cập nhật khung hình mới cho luồng AI
     with frame_lock:
         latest_frame = frame.copy()
 
-    # Lấy tọa độ Bounding Box mới nhất từ luồng AI
-    with boxes_lock:
-        boxes = list(shared_boxes)
-        fall_detected = shared_fall_detected
+    with data_lock:
+        results = list(shared_results)
+        confirm_count = fall_confirm_counter
 
     annotated_frame = frame.copy()
 
-    # Vẽ kết quả lên khung hình hiển thị
-    for (x1, y1, w, h) in boxes:
-        x2, y2 = x1 + w, y1 + h
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w_orig, x2), min(h_orig, y2)
+    # Vẽ đường ranh giới vạch mặt sàn (Đường nét đứt màu xám nhẹ)
+    cv2.line(annotated_frame, (0, floor_y_limit), (w_orig, floor_y_limit), (100, 100, 100), 1, cv2.LINE_AA)
+    cv2.putText(annotated_frame, "Ranh gioi mat san", (10, floor_y_limit - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
 
-        A, B, C, D = (x1, y1), (x2, y1), (x2, y2), (x1, y2)
-        AB = x2 - x1
-        AD = y2 - y1
+    trigger_alarm = False
 
-        is_lying = AB > AD
-        box_color = (0, 0, 255) if is_lying else (0, 255, 0)
+    for item in results:
+        x1, y1, w, h = item['box']
+        status = item['status']
+        angle = item['angle']
+        l_sh, r_sh, l_hp, r_hp = item['kpts']
 
-        cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), box_color, 2)
-        cv2.putText(annotated_frame, "A", (A[0] - 10, A[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-        cv2.putText(annotated_frame, "B", (B[0] + 5, B[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-        cv2.putText(annotated_frame, "C", (C[0] + 5, C[1] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-        cv2.putText(annotated_frame, "D", (D[0] - 10, D[1] + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-        cv2.putText(annotated_frame, f"AB={AB}px, AD={AD}px", (x1, max(20, y1 - 10)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+        # Quy định màu sắc theo trạng thái
+        if status == 2:      # Té ngã dưới sàn
+            box_color = (0, 0, 255)    # Đỏ
+            status_text = f"TE NGA DUS SAN! ({angle}deg)"
+        elif status == 1:    # Nằm trên giường/sofa
+            box_color = (0, 165, 255)  # Cam
+            status_text = f"Nam tren Giuong/Sofa ({angle}deg)"
+        else:                # Đứng / Ngồi bình thường
+            box_color = (0, 255, 0)    # Xanh lá
+            status_text = f"An Toan ({angle}deg)"
 
-    # Hiển thị cảnh báo báo động đỏ
-    if fall_detected:
+        # Vẽ Bounding Box
+        cv2.rectangle(annotated_frame, (x1, y1), (x1 + w, y1 + h), box_color, 2)
+
+        # Vẽ các điểm khớp xương Vai (Xanh dương) & Hông (Vàng)
+        if l_sh[2] > 0.3: cv2.circle(annotated_frame, (l_sh[0], l_sh[1]), 4, (255, 0, 0), -1)
+        if r_sh[2] > 0.3: cv2.circle(annotated_frame, (r_sh[0], r_sh[1]), 4, (255, 0, 0), -1)
+        if l_hp[2] > 0.3: cv2.circle(annotated_frame, (l_hp[0], l_hp[1]), 4, (0, 255, 255), -1)
+        if r_hp[2] > 0.3: cv2.circle(annotated_frame, (r_hp[0], r_hp[1]), 4, (0, 255, 255), -1)
+
+        # Nhãn trạng thái trên đầu đối tượng
+        cv2.putText(annotated_frame, status_text, (x1, max(20, y1 - 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, box_color, 2)
+
+    # 4. CHỈ BÁO ĐỘNG KHI ĐỦ SỐ LẦN XÁC NHẬN LIÊN TIẾP (CONFIRM_COUNT)
+    if confirm_count >= CONFIRM_COUNT_REQ:
         cv2.rectangle(annotated_frame, (0, 0), (w_orig, h_orig), (0, 0, 255), 10)
-        cv2.putText(annotated_frame, "BAO DONG DO: CANH AB > AD (TE NGA)!", (10, 35),
+        cv2.putText(annotated_frame, "CANH BAO TE NGA: PHAT HIEN NGUOI DUOI SAN!", (10, 35),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    cv2.imshow("Raspberry Pi 3B+ - Smooth Threaded Fall Detection", annotated_frame)
+    cv2.imshow("Smart Robot Patrol - Fall Detection", annotated_frame)
 
     if cv2.waitKey(1) & 0xFF == ord('q'):
         is_running = False
