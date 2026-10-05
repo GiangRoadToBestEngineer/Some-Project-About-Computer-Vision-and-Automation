@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 import onnxruntime as ort
-from picam2 import Picamera2
+from picamera2 import Picamera2
 
 # 1. KHỞI TẠO PICAMERA2
 print("Đang mở Pi Camera...")
